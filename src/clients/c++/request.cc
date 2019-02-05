@@ -1024,7 +1024,7 @@ InferContext::InferContext(
     CorrelationID correlation_id, bool verbose)
     : model_name_(model_name), model_version_(model_version),
       correlation_id_(correlation_id), verbose_(verbose), batch_size_(0),
-      async_request_id_(0), worker_(), exiting_(true)
+      async_request_id_(0), worker_(), exiting_(false)
 {
 }
 
@@ -1745,6 +1745,7 @@ InferHttpContext::Create(
 {
   InferHttpContext* ctx_ptr = new InferHttpContext(
       server_url, model_name, model_version, correlation_id, verbose);
+  ctx->reset(static_cast<InferContext*>(ctx_ptr));
 
   // Get status of the model and create the inputs and outputs.
   std::unique_ptr<ServerStatusContext> sctx;
@@ -1780,9 +1781,7 @@ InferHttpContext::Create(
   ctx_ptr->sync_request_.reset(
       static_cast<Request*>(new HttpRequestImpl(0, ctx_ptr->inputs_)));
 
-  if (err.IsOk()) {
-    ctx->reset(static_cast<InferContext*>(ctx_ptr));
-  } else {
+  if (!err.IsOk()) {
     ctx->reset();
   }
 
@@ -1863,10 +1862,7 @@ InferHttpContext::AsyncRun(std::shared_ptr<Request>* async_request)
     return Error(
         RequestStatusCode::INTERNAL,
         "failed to start HTTP asynchronous client");
-  } else if (exiting_) {
-    // abusing variable here, exiting_ is true either when destructor is called
-    // or the worker thread is not actually created.
-    exiting_ = false;
+  } else if (!worker_.joinable()) {
     worker_ = std::thread(&InferHttpContext::AsyncTransfer, this);
   }
 
@@ -2415,7 +2411,7 @@ class GrpcRequestImpl : public RequestImpl {
 };
 
 GrpcRequestImpl::GrpcRequestImpl(const uint64_t id, const uintptr_t run_index)
-    : RequestImpl(id)
+    : RequestImpl(id), grpc_status_()
 {
   run_index_ = run_index;
 }
@@ -2527,6 +2523,7 @@ InferGrpcContext::Create(
 {
   InferGrpcContext* ctx_ptr = new InferGrpcContext(
       server_url, model_name, model_version, correlation_id, verbose);
+  ctx->reset(static_cast<InferContext*>(ctx_ptr));
 
   // Create request context for synchronous request.
   ctx_ptr->sync_request_.reset(
@@ -2562,9 +2559,7 @@ InferGrpcContext::Create(
     }
   }
 
-  if (err.IsOk()) {
-    ctx->reset(static_cast<InferContext*>(ctx_ptr));
-  } else {
+  if (!err.IsOk()) {
     ctx->reset();
   }
 
@@ -2582,6 +2577,12 @@ InferGrpcContext::InferGrpcContext(
 InferGrpcContext::~InferGrpcContext()
 {
   exiting_ = true;
+  if (stream_ != nullptr) {
+    stream_->WritesDone();
+    // The reader thread will drain the stream properly
+    stream_worker_.join();
+  }
+
   // thread not joinable if AsyncRun() is not called
   // (it is default constructed thread before the first AsyncRun() call)
   if (worker_.joinable()) {
@@ -2633,8 +2634,7 @@ InferGrpcContext::Run(ResultMap* results)
 Error
 InferGrpcContext::AsyncRun(std::shared_ptr<Request>* async_request)
 {
-  if (exiting_) {
-    exiting_ = false;
+  if (!worker_.joinable()) {
     worker_ = std::thread(&InferGrpcContext::AsyncTransfer, this);
   }
   uintptr_t run_index;
@@ -2802,6 +2802,106 @@ InferGrpcContext::AsyncTransfer()
       cv_.notify_all();
     }
   } while (!exiting_);
+}
+
+Error
+InferGrpcContext::StreamRun()
+{
+  if (stream_ == nullptr) {
+    stream_ = stub_->StreamInfer(&context_);
+    // Initiate worker thread to read constantly
+    stream_worker_ = std::thread(&InferGrpcContext::StreamTransfer, this);
+  }
+
+  GrpcRequestImpl* grpc_request = new GrpcRequestImpl(0, 0);
+  std::shared_ptr<Request> request(static_cast<Request*>(grpc_request));
+
+  grpc_request->timer_.Reset();
+  grpc_request->timer_.Record(RequestTimers::Kind::SEND_START);
+  PreRunProcessing(request);
+  grpc_request->timer_.Record(RequestTimers::Kind::SEND_END);
+  {
+    std::lock_guard<std::mutex> lock(stream_mutex_);
+    pending_requests_.push(std::move(request));
+  }
+  grpc_request->timer_.Record(RequestTimers::Kind::REQUEST_START);
+  bool ok = stream_->Write(request_);
+
+  if (ok) {
+    return Error::Success;
+  } else {
+    return Error(RequestStatusCode::INTERNAL, "Stream has been closed.");
+  }
+}
+
+Error
+InferGrpcContext::GetStreamRunResults(ResultMap* results, bool wait)
+{
+  Error err = Error::Success;
+  std::shared_ptr<Request> request;
+  std::unique_lock<std::mutex> lock(stream_mutex_);
+  stream_cv_.wait(lock, [this, &err, wait] {
+    if (this->processed_requests_.empty()) {
+      if (this->pending_requests_.empty()) {
+        err = Error(
+            RequestStatusCode::INVALID,
+            "No pending request, please call StreamRun() first.");
+      } else if (wait) {
+        return false;
+      } else {
+        err = Error(RequestStatusCode::UNAVAILABLE, "Request is not ready.");
+      }
+    }
+    return true;
+  });
+
+  if (!err.IsOk()) {
+    lock.unlock();
+    return err;
+  } else {
+    request = std::move(processed_requests_.front());
+    processed_requests_.pop();
+  }
+  lock.unlock();
+
+  // Process response
+  std::shared_ptr<GrpcRequestImpl> grpc_request =
+      std::static_pointer_cast<GrpcRequestImpl>(request);
+  grpc_request->timer_.Record(RequestTimers::Kind::RECEIVE_START);
+  Error request_status = grpc_request->GetResults(*this, results);
+  grpc_request->timer_.Record(RequestTimers::Kind::RECEIVE_END);
+  err = UpdateStat(grpc_request->timer_);
+  if (!err.IsOk()) {
+    std::cerr << "Failed to update context stat: " << err << std::endl;
+  }
+  return err;
+}
+
+void
+InferGrpcContext::StreamTransfer()
+{
+  InferResponse response;
+  // End loop if Read() returns false
+  // (stream ended and all responses are drained)
+  while (stream_->Read(&response)) {
+    if (exiting_) {
+      continue;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(stream_mutex_);
+      processed_requests_.push(std::move(pending_requests_.front()));
+      pending_requests_.pop();
+      std::shared_ptr<GrpcRequestImpl> request =
+          std::static_pointer_cast<GrpcRequestImpl>(processed_requests_.back());
+      request->grpc_response_.Swap(&response);
+      request->timer_.Record(RequestTimers::Kind::REQUEST_END);
+      request->ready_ = true;
+    }
+    // send signal in case the main thread is waiting for response
+    stream_cv_.notify_all();
+  }
+  stream_->Finish();
 }
 
 //==============================================================================

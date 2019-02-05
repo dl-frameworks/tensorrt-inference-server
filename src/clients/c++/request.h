@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1088,12 +1089,38 @@ class InferGrpcContext : public InferContext {
       ResultMap* results, const std::shared_ptr<Request>& async_request,
       bool wait) override;
 
+  /// Send current request through the context's stream. All requests sent will
+  /// be directed to the same model instance, be processed, and be returned
+  /// in the same order. Note that you need to retrieve the responses with
+  /// GetStreamRunResults() method.
+  ///
+  /// \return Error object indicating success or failure.
+  Error StreamRun();
+
+  /// Retrieve the first of the remaining responses in the context's stream.
+  /// For instance, if there are multiple responses that haven't been retrieved,
+  /// then calling this method will retrieve the first of those responses which
+  /// are sent by the server through the stream.
+  ///
+  /// \param results Returns Result objects holding inference results
+  /// as a map from output name to Result object.
+  /// \param wait If true and there is at least one pending request,
+  /// block until one request is completed. Otherwise, return immediately.
+  /// \return Error object indicating success or failure. Success will be
+  /// returned only if the request has been completed succesfully. UNAVAILABLE
+  /// will be returned if 'wait' is false and no request has been processed.
+  /// INVALID will be returned if there are no pending requests.
+  Error GetStreamRunResults(ResultMap* results, bool wait);
+
  private:
   InferGrpcContext(
       const std::string&, const std::string&, int64_t, CorrelationID, bool);
 
   // @see InferContext.AsyncTransfer()
   void AsyncTransfer() override;
+
+  // Function for stream worker to proceed the data transfer in the stream
+  void StreamTransfer();
 
   // @see InferContext.PreRunProcessing()
   Error PreRunProcessing(std::shared_ptr<Request>& request) override;
@@ -1112,6 +1139,20 @@ class InferGrpcContext : public InferContext {
   // request for GRPC call, one request object can be used for multiple calls
   // since it can be overwritten as soon as the GRPC send finishes.
   InferRequest request_;
+
+  // thread and mutex to decouple read and write in the stream
+  std::mutex stream_mutex_;
+  std::condition_variable stream_cv_;
+  std::thread stream_worker_;
+
+  // queues to store requests in the stream
+  std::queue<std::shared_ptr<Request>> pending_requests_;
+  std::queue<std::shared_ptr<Request>> processed_requests_;
+
+  // gRPC objects for using the streaming API
+  grpc::ClientContext context_;
+  std::shared_ptr<grpc::ClientReaderWriter<InferRequest, InferResponse>>
+      stream_;
 };
 
 //==============================================================================
